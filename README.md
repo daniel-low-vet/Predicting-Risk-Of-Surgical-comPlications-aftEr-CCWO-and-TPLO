@@ -6,6 +6,7 @@
 
 **Model**
 
+* Machine learning performed in Python 3.11.13.
 * The XGBoost classifier was trained on the dataset with Bayesian hyperparameter optimisation to predict postoperative ambulation recovery.
 * Best XGBoost hyperparameters: {'learning_rate': 0.16,'max_depth': 3, 'n_estimators': 400,
 'subsample': 0.80, 'colsample_bytree': 0.92}
@@ -16,7 +17,7 @@
 
 **Files in this Repository**
 
-📂 
+📂 Python code
 
 📂 MIT LICENSE - CC Attributions 4.0 Open Source License
 
