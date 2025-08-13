@@ -1,0 +1,302 @@
+# Import packages
+import numpy as np
+import pandas as pd
+import sklearn
+import scipy
+import matplotlib as plt
+import seaborn as sns
+import imblearn
+import optuna
+from xgboost import XGBClassifier
+import xgboost as xgb
+import shap
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, PolynomialFeatures
+from imblearn.over_sampling import SMOTENC
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import brier_score_loss
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, hamming_loss, coverage_error, label_ranking_loss, average_precision_score
+from sklearn.calibration import calibration_curve
+from sklearn.model_selection import StratifiedShuffleSplit
+from scipy.interpolate import interp1d
+from sklearn.utils import resample
+from scipy.ndimage import gaussian_filter1d
+from scipy.stats import ttest_rel, wilcoxon
+from tqdm.auto import tqdm
+
+# Load data
+df = data
+
+# Preprocess
+categorical_features = ['surgeon', 'breed', 'sex', 'limb',
+                        'bilat_single_stage', 'technique', 'implant',
+                        'arthrotomy', 'meniscectomy', 'IntraC']
+numerical_features = ['age', 'weight']
+target = ['MinorC', 'SurgC', 'MedC', 'AllC']
+
+encoder = OneHotEncoder(drop='first', sparse_output=False)
+X_categorical = encoder.fit_transform(df[categorical_features])
+X_numerical = df[numerical_features].values
+X = np.hstack([X_categorical, X_numerical])
+y = df[target].values
+
+smote = SMOTENC(categorical_features=list(range(X_categorical.shape[1])), random_state=42)
+X_res, y_res = smote.fit_resample(X, y.argmax(axis=1))
+
+y_res_onehot = np.eye(4)[y_res]
+
+poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+X_poly = poly.fit_transform(X_res)
+
+X_train, X_test, y_train, y_test = train_test_split(X_poly, y_res_onehot, test_size=0.2, random_state=42, stratify=y_res)
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# Optuna study
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=100),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0)
+    }
+    model = xgb.XGBClassifier(**params, use_label_encoder=False, eval_metric='logloss')
+    model.fit(X_train, y_train)
+
+    # Predict probabilities and calculate Brier score
+    y_pred_proba = model.predict_proba(X_test)
+    brier = brier_score_loss(y_test.ravel(), y_pred_proba.ravel())
+    return brier
+
+study = optuna.create_study(direction='minimize')
+study.optimize(objective, n_trials=50)
+
+best_model = xgb.XGBClassifier(**best_params, use_label_encoder=False, eval_metric='logloss')
+best_model.fit(X_train, y_train)
+
+for seed in range(100):
+    # Re-split with new random seed
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_poly, y_res_onehot, test_size=0.2, stratify=y_res, random_state=seed
+    )
+
+    # Scale
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # Train model
+    model = xgb.XGBClassifier(
+        **best_params,
+        use_label_encoder=False,
+        eval_metric='logloss',
+        random_state=seed
+    )
+    model.fit(X_train, y_train)
+
+    # Predict probabilities
+    y_pred_proba = model.predict_proba(X_test)
+    if isinstance(y_pred_proba, list):
+        # xgboost returns list of arrays per class in multi-output case
+        y_pred_proba = np.stack([p[:, 1] for p in y_pred_proba], axis=1)
+
+    # Brier scores per class
+    brier_scores = {}
+    for i, name in enumerate(target_names):
+        brier_scores[f"Brier_{name}"] = brier_score_loss(y_test[:, i], y_pred_proba[:, i])
+    results_list.append(brier_scores)
+
+# Results output
+calibration_data = {i: [] for i in range(y_train.shape[1])}
+prob_bins = np.linspace(0.05, 0.95, 10)
+
+for run in range(100):
+    model = xgb.XGBClassifier(**best_params, use_label_encoder=False, eval_metric='logloss')
+    model.fit(X_train, y_train)
+    y_pred_proba = model.predict_proba(X_test)
+
+    if isinstance(y_pred_proba, list):
+        y_pred_proba = np.stack([p[:, 1] for p in y_pred_proba], axis=1)
+
+    for i in range(y_train.shape[1]):
+        prob_true, prob_pred = calibration_curve(y_test[:, i], y_pred_proba[:, i], n_bins=10)
+        if len(prob_pred) >= 2:
+            interp = interp1d(prob_pred, prob_true, bounds_error=False, fill_value='extrapolate')
+            interp_true = interp(prob_bins)
+            calibration_data[i].append(interp_true)
+
+for i in range(3):
+    all_runs = np.array(calibration_data[i])
+    mean_curve = all_runs.mean(axis=0)
+    std_curve = all_runs.std(axis=0)
+
+    plt.plot(prob_bins, mean_curve, label=f"{class_names[i]}")
+    plt.fill_between(prob_bins, mean_curve - std_curve, mean_curve + std_curve, alpha=0.2)
+
+# 100 runs
+n_runs = 100
+test_size = 0.2
+random_state_base = 42
+target = ['MinorC', 'SurgC', 'MedC', 'AllC']
+categorical_features = ['surgeon', 'breed', 'sex', 'limb',
+                        'bilat_single_stage', 'technique', 'implant',
+                        'arthrotomy', 'meniscectomy', 'IntraC']
+numerical_features = ['age', 'weight']
+
+metrics_per_run = []
+
+for seed in range(n_runs):
+    encoder = OneHotEncoder(drop='first', sparse_output=False)
+    X_cat = encoder.fit_transform(df[categorical_features])
+    X_num = df[numerical_features].values
+    X = np.hstack([X_cat, X_num])
+    y = df[target].values
+
+    smote = SMOTENC(categorical_features=list(range(X_cat.shape[1])), random_state=seed)
+    y_res_labels = y.argmax(axis=1)
+    X_res, y_res = smote.fit_resample(X, y_res_labels)
+    y_res_onehot = np.eye(4)[y_res]
+
+    poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+    X_poly = poly.fit_transform(X_res)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_poly, y_res_onehot, test_size=test_size, random_state=seed, stratify=y_res)
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    y_pred_proba = np.zeros_like(y_test, dtype=float)
+    y_pred_binary = np.zeros_like(y_test, dtype=int)
+
+    for i, class_name in enumerate(target):
+        unique_labels = np.unique(y_train[:, i])
+        if len(unique_labels) < 2:
+            print(f"Seed {seed} - skipping {class_name} (only one class in training set)")
+            continue
+        clf = XGBClassifier(
+            n_estimators=400,
+            max_depth=3,
+            learning_rate=0.1595660273094523,
+            subsample=0.7951615282903975,
+            colsample_bytree=0.9244822829621413,
+            eval_metric='logloss',
+            random_state=seed
+        )
+        clf.fit(X_train, y_train[:, i])
+        y_pred_proba[:, i] = clf.predict_proba(X_test)[:, 1]
+        y_pred_binary[:, i] = (y_pred_proba[:, i] > 0.5).astype(int)
+
+    for i, class_name in enumerate(target):
+        y_true_cls = y_test[:, i]
+        y_prob_cls = y_pred_proba[:, i]
+        y_pred_cls = y_pred_binary[:, i]
+
+        tn, fp, fn, tp = confusion_matrix(y_true_cls, y_pred_cls, labels=[0, 1]).ravel()
+        sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+        ppv  = tp / (tp + fp) if (tp + fp) > 0 else 0
+        npv  = tn / (tn + fn) if (tn + fn) > 0 else 0
+
+        try:
+            auc = roc_auc_score(y_true_cls, y_prob_cls)
+        except ValueError:
+            auc = np.nan
+
+        acc = accuracy_score(y_true_cls, y_pred_cls)
+
+        metrics_per_run.append({
+            'Seed': seed,
+            'Class': class_name,
+            'AUC': auc,
+            'Accuracy': acc,
+            'Sensitivity': sens,
+            'Specificity': spec,
+            'PPV': ppv,
+            'NPV': npv
+        })
+
+all_runs_df = pd.DataFrame(metrics_per_run)
+
+summary_metrics = []
+for class_name in target:
+    class_df = all_runs_df[all_runs_df['Class'] == class_name]
+    for metric in ['AUC', 'Accuracy', 'Sensitivity', 'Specificity', 'PPV', 'NPV']:
+        vals = class_df[metric].dropna()
+        summary_metrics.append({
+            'Class': class_name,
+            'Metric': metric,
+            'Mean': vals.mean(),
+            'Std': vals.std(),
+            'CI Lower (2.5%)': vals.quantile(0.025),
+            'CI Upper (97.5%)': vals.quantile(0.975)
+        })
+
+summary_df = pd.DataFrame(summary_metrics)
+print(summary_df)
+
+# Feature importance
+base_features = encoder.get_feature_names_out(categorical_features).tolist() + numerical_features
+feature_names = poly.get_feature_names_out(input_features=base_features)
+feature_importances = best_model.feature_importances_
+sorted_idx = np.argsort(feature_importances)[::-1]
+top_n = 20
+top_features = np.array(feature_names)[sorted_idx][:top_n]
+top_importances = feature_importances[sorted_idx][:top_n]
+
+# Fix test set of 50 dogs
+N_FIXED = 50
+np.random.seed(42)
+indices = np.arange(len(X_poly))
+y_labels = y_res_onehot.argmax(axis=1)
+sss = StratifiedShuffleSplit(n_splits=1, test_size=N_FIXED, random_state=42)
+train_idx, fixed_test_idx = next(sss.split(X_poly, y_labels))
+
+X_train_all = X_poly[train_idx]
+y_train_all = y_res_onehot[train_idx]
+X_fixed = X_poly[fixed_test_idx]
+y_fixed = y_res_onehot[fixed_test_idx]
+
+scaler = StandardScaler()
+X_train_all = scaler.fit_transform(X_train_all)
+X_fixed = scaler.transform(X_fixed)
+
+n_classes = y_res_onehot.shape[1]
+predictions_per_dog = np.zeros((N_FIXED, n_classes, 100))
+
+for i in tqdm(range(100), desc="Training models"):
+    sss_inner = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=i)
+    split_train_idx, _ = next(sss_inner.split(X_train_all, y_train_all.argmax(axis=1)))
+
+    X_train = X_train_all[split_train_idx]
+    y_train = y_train_all[split_train_idx]
+
+    models = []
+    for c in range(n_classes):
+        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', verbosity=0)
+        model.fit(X_train, y_train[:, c])
+        models.append(model)
+
+    for c in range(n_classes):
+        preds = models[c].predict_proba(X_fixed)[:, 1]
+        predictions_per_dog[:, c, i] = preds
+
+cv_results = []
+for dog_i in range(N_FIXED):
+    for class_i in range(n_classes):
+        probs = predictions_per_dog[dog_i, class_i, :]
+        mean_p = probs.mean()
+        std_p = probs.std()
+        cv = std_p / mean_p if mean_p > 0 else np.nan
+        cv_results.append({
+            'Dog': dog_i,
+            'Class': ['MinorC', 'SurgC', 'MedC', 'AllC'][class_i],
+            'Mean_Prob': mean_p,
+            'Std_Prob': std_p,
+            'CV': cv
+        })
+
+cv_df = pd.DataFrame(cv_results)
