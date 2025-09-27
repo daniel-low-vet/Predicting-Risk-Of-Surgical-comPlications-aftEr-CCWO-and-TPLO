@@ -2,7 +2,7 @@
 **Overview**
 * This repository contains the code and trained XGBoost model for the <b><u>PROSPECT</u></b> (<b><u>P</u></b>redicting <b><u>R</u></b>isk <b><u>O</u></b>f <b><u>S</u></b>urgical com<b><u>P</u></b>lications aft<b><u>E</u></b>r <b><u>C</u></b>CWO and T<b><u>P</u></b>LO)
  model.
-* Publication pending.
+* Published on <i>Veterinary Surgery</i> [here](https://doi.org/10.1111/vsu.70007).
 
 **Model**
 
